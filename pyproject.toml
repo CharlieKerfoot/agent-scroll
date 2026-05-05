@@ -1,7 +1,7 @@
 [project]
 name = "doomscroll"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hermes Doomscroll Agent: cognitive simulation of feed consumption"
 readme = "README.md"
 authors = [
     { name = "charliekerfoot", email = "charliekerfoot@gmail.com" }
@@ -12,6 +12,9 @@ dependencies = [
     "numpy>=2.4.4",
     "openai>=2.34.0",
 ]
+
+[project.scripts]
+doomscroll-pilot = "doomscroll.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.22,<0.9.0"]
