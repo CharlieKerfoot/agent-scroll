@@ -86,6 +86,21 @@ class TestBuildPrompt:
         prompt = build_prompt([], [], mood=0.0, config=cfg, now=0.0, seed=0)
         assert "AT MOST 5" in prompt
 
+    def test_prompt_demands_integer_target_id(self):
+        # Cheap models hallucinate string slugs unless told explicitly.
+        prompt = build_prompt([], [], mood=0.0, config=ConsolidationConfig(),
+                              now=0.0, seed=0)
+        assert "INTEGER" in prompt
+        assert "Never a string" in prompt or "NEVER a string" in prompt
+
+    def test_prompt_includes_concrete_example(self):
+        # The last-pattern-before-generation worked example is the
+        # load-bearing thing that gets cheap models to comply.
+        prompt = build_prompt([], [], mood=0.0, config=ConsolidationConfig(),
+                              now=0.0, seed=0)
+        assert "EXAMPLE" in prompt
+        assert '"target_id": 3' in prompt or '"target_id": 7' in prompt
+
     def test_fragments_capped_to_max(self):
         cfg = ConsolidationConfig(fragment_max_count=3)
         frags = [_frag(f"frag-{i}") for i in range(10)]

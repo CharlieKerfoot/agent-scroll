@@ -91,13 +91,33 @@ FRAGMENTS FROM TODAY (no order, no sources):
 
 MOOD AT END OF DAY: {mood:.2f}  (range -1 to +1)
 
-OUTPUT a JSON array of belief updates. Each update has these fields:
+OUTPUT FORMAT
+Return a JSON array of belief updates. Fields per update:
 - "action": one of "new" | "strengthen" | "weaken" | "replace" | "drop"
-- "text": the belief text (required for "new" and "replace", omit otherwise)
-- "target_id": the existing belief id (required for "strengthen", "weaken", "replace", "drop", omit for "new")
-- "new_confidence": float in [0, 1] (required for "new", "strengthen", "weaken", "replace"; omit for "drop")
+- "target_id": for strengthen/weaken/replace/drop, the INTEGER id of an
+  existing belief (the number after "id=" in EXISTING BELIEFS above).
+  Always a bare integer like 3 or 17. Never a string.
+- "text": belief text (required for new and replace, omit otherwise)
+- "new_confidence": float in [0, 1] (required for new/strengthen/weaken/
+  replace, omit for drop)
 
-Return ONLY the JSON array. No prose. Empty array [] is a valid answer if nothing settled.
+EXAMPLE 1 -- when EXISTING BELIEFS is empty (early sessions).
+Only "new" actions apply. If a fragment landed at all, write it down:
+[
+  {{"action": "new", "text": "things feel more compressed lately", "new_confidence": 0.5}}
+]
+
+EXAMPLE 2 -- when EXISTING BELIEFS includes [id=3] and [id=7]:
+[
+  {{"action": "strengthen", "target_id": 3, "new_confidence": 0.8}},
+  {{"action": "drop", "target_id": 7}}
+]
+
+Default to writing SOMETHING -- a single "new" with confidence 0.4 is
+better than nothing if any fragment had heat. Return [] only when the
+day was genuinely flat.
+
+Return ONLY the JSON array. No prose, no code fences, no commentary.
 """
 
 
@@ -298,4 +318,8 @@ def consolidate(
     """Run one consolidation pass. Returns at most max_belief_updates_per_pass."""
     prompt = build_prompt(fragments, beliefs, mood, config, now, seed)
     raw = llm.generate(prompt)
+    logger.info(
+        "consolidation: %d fragments, %d beliefs in -> raw[:500]=%r",
+        len(fragments), len(beliefs), raw[:500],
+    )
     return parse_belief_updates(raw, config)

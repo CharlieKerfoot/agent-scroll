@@ -97,6 +97,9 @@ def _configure_logging(output_dir: Path) -> _RejectionCounter:
     root.addHandler(file_h)
     root.addHandler(stderr_h)
     root.addHandler(counter)
+    # Quiet down noisy HTTP libs so pilot.log stays focused on doomscroll
+    for noisy in ("httpx", "httpcore", "openai", "anthropic", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     return counter
 
 
