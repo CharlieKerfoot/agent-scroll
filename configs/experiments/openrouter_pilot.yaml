@@ -1,0 +1,31 @@
+# OpenRouter pilot. Start cheap with open-source models, swap up later.
+# Run with: doomscroll-pilot --config configs/experiments/openrouter_pilot.yaml
+#
+# Picking a model:
+#   meta-llama/llama-3.3-70b-instruct       capable, ~$0.13/M in / $0.40/M out
+#   qwen/qwen-2.5-72b-instruct              good at JSON, ~$0.23/M in / $0.40/M out
+#   mistralai/mistral-nemo                  ~$0.04/M in / $0.04/M out (very cheap)
+#   meta-llama/llama-3.1-8b-instruct        ~$0.02/M in / $0.05/M out (cheapest)
+#   deepseek/deepseek-chat                  capable, ~$0.27/M in / $1.10/M out
+#
+# OpenRouter does NOT do embeddings. Use OpenAI for that, or fake for
+# mechanism-only validation.
+
+output_dir: ./pilot-openrouter
+
+llm:
+  provider: openrouter
+  model: meta-llama/llama-3.3-70b-instruct
+  temperature: 0.7
+
+embedder:
+  # Mechanism validation: keep fake for the first run, no embedding spend.
+  # Switch to openai for the run that produces real belief geometry.
+  provider: fake
+  # provider: openai
+  # model: text-embedding-3-small
+
+pilot:
+  sessions: 3
+  posts_per_session: 30
+  seed: 42

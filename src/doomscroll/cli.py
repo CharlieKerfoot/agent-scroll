@@ -35,6 +35,7 @@ from typing import Any
 
 import numpy as np
 import yaml
+from dotenv import load_dotenv
 
 from doomscroll.agent_loop import run_session
 from doomscroll.config import DistortionConfig
@@ -293,6 +294,11 @@ def _print_results_summary(per_agent: list[dict], cross: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load .env from CWD if present so API keys reach the SDKs without
+    # the user having to `source` or use `uv run --env-file`. Existing
+    # environment variables win (override=False).
+    load_dotenv(override=False)
+
     args = _build_arg_parser().parse_args(argv)
 
     overrides = _parse_overrides(args.set)

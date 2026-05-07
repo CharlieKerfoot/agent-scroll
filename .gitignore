@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets — never commit
+.env
+.env.local
+
+# Pilot output (per-run DBs and results)
+pilot-output/
+pilot-*/
