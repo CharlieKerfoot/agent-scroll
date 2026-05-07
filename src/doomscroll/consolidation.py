@@ -20,6 +20,7 @@ based on eval results, not on the orchestration code below.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from numpy.typing import NDArray
 
 from doomscroll.config import ConsolidationConfig
 from doomscroll.memory import Belief, weighted_belief_sample
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -172,29 +175,50 @@ def parse_belief_updates(
     try:
         cleaned = _extract_json_array(raw_output)
         data = json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            "consolidation: rejecting whole response (json decode failed: %s); "
+            "raw[:200]=%r",
+            e, raw_output[:200],
+        )
         return []
     if not isinstance(data, list):
+        logger.warning(
+            "consolidation: rejecting whole response (top-level is %s, not list); "
+            "raw[:200]=%r",
+            type(data).__name__, raw_output[:200],
+        )
         return []
 
     updates: list[BeliefUpdate] = []
-    for item in data[: config.max_belief_updates_per_pass]:
+    for idx, item in enumerate(data[: config.max_belief_updates_per_pass]):
         if not isinstance(item, dict):
+            logger.warning(
+                "consolidation: skip update[%d] (not a dict, got %s)",
+                idx, type(item).__name__,
+            )
             continue
         action_raw = item.get("action")
         try:
             action = BeliefAction(action_raw)
         except (ValueError, TypeError):
+            logger.warning(
+                "consolidation: skip update[%d] (unknown action=%r); item=%r",
+                idx, action_raw, item,
+            )
             continue
 
         text = item.get("text")
-        # Coerce target_id once. Cheaper models sometimes hallucinate string
-        # ids like "existing_belief_1" or wrap ints in quotes; accept both,
-        # reject anything that isn't actually integer-valued.
         target_id = _coerce_int(item.get("target_id"))
         new_confidence = item.get("new_confidence")
 
         if not _is_valid_update(action, text, target_id, new_confidence):
+            logger.warning(
+                "consolidation: skip update[%d] (failed validation for "
+                "action=%s, target_id=%r->%r, conf=%r); item=%r",
+                idx, action.value, item.get("target_id"), target_id,
+                new_confidence, item,
+            )
             continue
 
         updates.append(

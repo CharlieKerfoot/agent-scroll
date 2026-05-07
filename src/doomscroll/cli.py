@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -60,6 +61,43 @@ from doomscroll.run_config import RunConfig
 
 SESSION_DURATION_SECONDS = 30 * 60  # 30-min compressed session
 DAY_SECONDS = 24 * 3600
+
+
+class _RejectionCounter(logging.Handler):
+    """Counts WARNING records by their logger module. Used for the end-of-pilot
+    summary so silent drops aren't silent."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.counts: dict[str, int] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.WARNING:
+            self.counts[record.name] = self.counts.get(record.name, 0) + 1
+
+
+def _configure_logging(output_dir: Path) -> _RejectionCounter:
+    """File log captures everything; stderr captures warnings+; counter
+    handler tracks warning counts for the final summary."""
+    log_path = output_dir / "pilot.log"
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    file_h = logging.FileHandler(log_path, mode="w")
+    file_h.setLevel(logging.INFO)
+    file_h.setFormatter(logging.Formatter(fmt))
+    stderr_h = logging.StreamHandler(sys.stderr)
+    stderr_h.setLevel(logging.WARNING)
+    stderr_h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    counter = _RejectionCounter()
+    root = logging.getLogger()
+    # Reset to avoid duplicate handlers across repeated main() invocations
+    # (tests, --print-config dry runs, etc.)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(logging.INFO)
+    root.addHandler(file_h)
+    root.addHandler(stderr_h)
+    root.addHandler(counter)
+    return counter
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -316,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     cfg.write_to(cfg.output_dir / "config.yaml")
+    rejection_counter = _configure_logging(cfg.output_dir)
 
     embedder = _build_embedder(cfg)
     llm = _build_llm(cfg)
@@ -368,6 +407,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nresults written to: {results_path}")
     print(f"resolved config:    {cfg.output_dir / 'config.yaml'}")
     print(f"elapsed: {elapsed:.1f}s")
+
+    if rejection_counter.counts:
+        print()
+        print("WARNINGS (silent drops -- check pilot.log for details):")
+        for module, n in sorted(rejection_counter.counts.items()):
+            print(f"  {module:<32} {n}")
+        print(f"  full log:                        {cfg.output_dir / 'pilot.log'}")
     return 0
 
 
