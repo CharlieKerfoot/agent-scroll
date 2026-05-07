@@ -188,7 +188,10 @@ def parse_belief_updates(
             continue
 
         text = item.get("text")
-        target_id = item.get("target_id")
+        # Coerce target_id once. Cheaper models sometimes hallucinate string
+        # ids like "existing_belief_1" or wrap ints in quotes; accept both,
+        # reject anything that isn't actually integer-valued.
+        target_id = _coerce_int(item.get("target_id"))
         new_confidence = item.get("new_confidence")
 
         if not _is_valid_update(action, text, target_id, new_confidence):
@@ -198,7 +201,7 @@ def parse_belief_updates(
             BeliefUpdate(
                 action=action,
                 text=text if isinstance(text, str) else None,
-                target_id=int(target_id) if target_id is not None else None,
+                target_id=target_id,
                 new_confidence=(
                     float(new_confidence) if new_confidence is not None else None
                 ),
@@ -207,10 +210,30 @@ def parse_belief_updates(
     return updates
 
 
+def _coerce_int(x: object) -> int | None:
+    """Best-effort int coercion for LLM-produced ids.
+
+    Accepts: int, "5", "  7  ", 3.0. Rejects: bool, "id_foo", 3.14, None,
+    arbitrary objects. Returning None signals "skip this update."
+    """
+    if x is None or isinstance(x, bool):  # bool is an int subclass, reject
+        return None
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(x) if x.is_integer() else None
+    if isinstance(x, str):
+        try:
+            return int(x.strip())
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def _is_valid_update(
     action: BeliefAction,
     text: str | None,
-    target_id: int | float | None,
+    target_id: int | None,
     new_confidence: float | None,
 ) -> bool:
     if action == BeliefAction.NEW:

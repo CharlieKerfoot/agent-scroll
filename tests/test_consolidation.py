@@ -184,6 +184,48 @@ class TestParseBeliefUpdates:
         result = parse_belief_updates(raw, ConsolidationConfig())
         assert len(result) == 1
 
+    # --- Robustness against cheap-model output drift ---
+
+    def test_string_target_id_hallucination_rejected(self):
+        # The Mistral-Nemo failure mode: target_id="existing_belief_1"
+        raw = json.dumps([
+            {"action": "drop", "target_id": "existing_belief_1"},
+            {"action": "strengthen", "target_id": "belief_3", "new_confidence": 0.8},
+        ])
+        assert parse_belief_updates(raw, ConsolidationConfig()) == []
+
+    def test_numeric_string_target_id_accepted(self):
+        # Many models stringify ints. "5" should still mean 5.
+        raw = json.dumps([{"action": "drop", "target_id": "5"}])
+        result = parse_belief_updates(raw, ConsolidationConfig())
+        assert len(result) == 1
+        assert result[0].target_id == 5
+
+    def test_integer_valued_float_accepted(self):
+        raw = json.dumps([{"action": "drop", "target_id": 3.0}])
+        result = parse_belief_updates(raw, ConsolidationConfig())
+        assert len(result) == 1
+        assert result[0].target_id == 3
+
+    def test_non_integer_float_rejected(self):
+        raw = json.dumps([{"action": "drop", "target_id": 3.14}])
+        assert parse_belief_updates(raw, ConsolidationConfig()) == []
+
+    def test_bool_target_id_rejected(self):
+        # True/False are int subclass in Python; reject explicitly.
+        raw = json.dumps([{"action": "drop", "target_id": True}])
+        assert parse_belief_updates(raw, ConsolidationConfig()) == []
+
+    def test_one_bad_update_doesnt_kill_others(self):
+        raw = json.dumps([
+            {"action": "drop", "target_id": "garbage_id"},      # rejected
+            {"action": "new", "text": "kept", "new_confidence": 0.4},  # accepted
+            {"action": "strengthen", "target_id": "x", "new_confidence": 0.5},  # rejected
+        ])
+        result = parse_belief_updates(raw, ConsolidationConfig())
+        assert len(result) == 1
+        assert result[0].text == "kept"
+
 
 class TestConsolidate:
     def test_uses_llm_output(self):
