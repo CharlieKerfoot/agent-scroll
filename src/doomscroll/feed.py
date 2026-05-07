@@ -213,19 +213,25 @@ class SyntheticFeed:
         self._posts: list[Post] = self._build()
 
     def _build(self) -> list[Post]:
-        out: list[Post] = []
+        # Build metadata + texts first; embed in one batch. The single-call
+        # path was fine for FakeEmbedder but cost N API roundtrips for
+        # OpenAIEmbedder (~1s/post, painfully slow at pilot scale).
+        meta: list[tuple[str, str, float, str]] = []
         for i in range(self.n_posts):
             topic, templates = self._TOPICS[self._rng.integers(len(self._TOPICS))]
             template = templates[self._rng.integers(len(templates))]
             text = template.format(n=self._rng.integers(2, 9))
             post_id = f"syn-{i:06d}"
             ts = self.start_ts + i * self.post_interval
-            embedding = self.embedder.embed(text)
-            out.append(Post(
-                id=post_id, author=f"user-{topic}", ts=ts,
-                text=text, embedding=embedding,
-            ))
-        return out
+            author = f"user-{topic}"
+            meta.append((post_id, author, ts, text))
+
+        texts = [m[3] for m in meta]
+        embeddings = self.embedder.embed_batch(texts)
+        return [
+            Post(id=pid, author=author, ts=ts, text=text, embedding=emb)
+            for (pid, author, ts, text), emb in zip(meta, embeddings)
+        ]
 
     def __len__(self) -> int:
         return len(self._posts)

@@ -19,11 +19,11 @@ llm:
   temperature: 0.7
 
 embedder:
-  # Mechanism validation: keep fake for the first run, no embedding spend.
-  # Switch to openai for the run that produces real belief geometry.
-  provider: fake
-  # provider: openai
-  # model: text-embedding-3-small
+  # OpenAI for real belief geometry. Snapshot pre-embed batches once;
+  # cost on a 100-post pilot is well under a cent.
+  # Override to provider=fake for mechanism-only ablations.
+  provider: openai
+  model: text-embedding-3-small
 
 pilot:
   sessions: 3
