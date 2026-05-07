@@ -1,24 +1,27 @@
 """Command-line pilot runner.
 
-Single-command entry point that ties the whole architecture together:
-    1. Loads or generates a snapshot
-    2. For each requested agent variant, runs N sessions on a per-agent DB
-    3. Computes measurement comparisons (drift, entropy, divergence)
-    4. Writes results to disk and prints summary
+Configuration source of truth is YAML, validated by Pydantic. The CLI is
+a thin layer:
+
+    1. Load --config <path> (or built-in defaults if omitted)
+    2. Apply --set key.path=value overrides (typed via YAML scalar parsing)
+    3. Snapshot the resolved config to <output_dir>/config.yaml
+    4. Run sessions, write per-agent DBs + results.json
 
 Usage examples:
-    # Smoke test with everything fake (no API keys needed)
-    uv run doomscroll-pilot --provider fake --output-dir ./out
 
-    # Real run with Claude + OpenAI embeddings
+    # Smoke test, all defaults (fake LLM, synthetic feed)
+    uv run doomscroll-pilot
+
+    # Real experiment from a versioned config file
+    uv run doomscroll-pilot --config configs/experiments/anthropic_pilot.yaml
+
+    # Quick override without editing YAML
     uv run doomscroll-pilot \\
-        --provider anthropic --model claude-sonnet-4-6 \\
-        --embedder openai --embedder-model text-embedding-3-small \\
-        --sessions 3 --posts-per-session 50 \\
-        --output-dir ./pilot-2026-05
-
-The output directory contains: agent_<variant>.db per agent, plus a
-results.json with measurement metrics.
+        --config configs/default.yaml \\
+        --set pilot.sessions=5 \\
+        --set llm.provider=anthropic \\
+        --set llm.model=claude-sonnet-4-6
 """
 
 from __future__ import annotations
@@ -28,16 +31,13 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import yaml
 
 from doomscroll.agent_loop import run_session
-from doomscroll.config import (
-    AGENT_VARIANTS,
-    ConsolidationConfig,
-    DistortionConfig,
-    MemoryConfig,
-)
+from doomscroll.config import DistortionConfig
 from doomscroll.embedding import (
     Embedder,
     EmbeddingConfig,
@@ -50,11 +50,11 @@ from doomscroll.feed import (
 )
 from doomscroll.llm import LLMConfig, make_llm
 from doomscroll.measurement import (
-    belief_drift,
     cross_agent_divergence,
     topic_entropy,
 )
 from doomscroll.persistence import Store
+from doomscroll.run_config import RunConfig
 
 
 SESSION_DURATION_SECONDS = 30 * 60  # 30-min compressed session
@@ -64,102 +64,83 @@ DAY_SECONDS = 24 * 3600
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="doomscroll-pilot",
-        description="Run a doomscroll cognitive simulation pilot.",
+        description=(
+            "Run a doomscroll cognitive simulation pilot. "
+            "All parameters live in a YAML config; pass --config to point at "
+            "one, or use --set for ad-hoc overrides."
+        ),
     )
     p.add_argument(
-        "--provider",
-        choices=["anthropic", "openai", "openrouter", "fake"],
-        default="fake",
-        help="LLM provider for reactions + consolidation (default: fake)",
-    )
-    p.add_argument(
-        "--model",
-        help="LLM model name (required for non-fake providers)",
-    )
-    p.add_argument(
-        "--embedder",
-        choices=["openai", "fake"],
-        default="fake",
-        help="Embedding provider (default: fake)",
-    )
-    p.add_argument(
-        "--embedder-model",
-        default="text-embedding-3-small",
-        help="Embedding model (only used when --embedder openai)",
-    )
-    p.add_argument(
-        "--snapshot",
+        "--config",
         type=Path,
-        help="Path to a prepared snapshot JSON. If omitted, synthetic feed is used.",
+        help="Path to a pilot YAML config. Omit to use built-in defaults.",
     )
     p.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("./pilot-output"),
-        help="Directory for per-agent DBs and results.json",
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override a config field, e.g. --set pilot.sessions=5. "
+            "Dotted paths target nested fields. Repeatable."
+        ),
     )
     p.add_argument(
-        "--variants",
-        default=",".join(AGENT_VARIANTS.keys()),
-        help="Comma-separated agent variant names (default: all 4)",
-    )
-    p.add_argument(
-        "--sessions",
-        type=int,
-        default=3,
-        help="Number of sessions per agent (default: 3)",
-    )
-    p.add_argument(
-        "--posts-per-session",
-        type=int,
-        default=50,
-        help="Posts to scroll per session (default: 50)",
-    )
-    p.add_argument("--seed", type=int, default=42, help="RNG seed (default: 42)")
-    p.add_argument(
-        "--no-consolidation",
+        "--print-config",
         action="store_true",
-        help="Skip the nightly consolidation pass (debug)",
-    )
-    p.add_argument(
-        "--temperature", type=float, default=0.7, help="LLM temperature"
+        help="Resolve config, print it, and exit without running.",
     )
     return p
 
 
-def _resolve_variants(spec: str) -> dict[str, DistortionConfig]:
-    names = [n.strip() for n in spec.split(",") if n.strip()]
-    out = {}
-    for name in names:
-        if name not in AGENT_VARIANTS:
-            valid = ", ".join(sorted(AGENT_VARIANTS))
-            raise SystemExit(f"unknown variant {name!r}; valid: {valid}")
-        out[name] = AGENT_VARIANTS[name]
-    if not out:
-        raise SystemExit("no variants selected")
+def _parse_overrides(items: list[str]) -> dict[str, Any]:
+    """Parse `--set a.b=c` into a nested dict. Values go through YAML scalar
+    parsing so `5`, `true`, `null`, `[a, b]` all DTRT."""
+    out: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
+        key, _, raw = item.partition("=")
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--set has empty key: {item!r}")
+        try:
+            value = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise SystemExit(f"--set {item!r}: invalid value ({e})") from e
+        cursor = out
+        parts = key.split(".")
+        for p in parts[:-1]:
+            cursor = cursor.setdefault(p, {})
+            if not isinstance(cursor, dict):
+                raise SystemExit(
+                    f"--set {item!r}: {p} conflicts with non-mapping override"
+                )
+        cursor[parts[-1]] = value
     return out
 
 
-def _build_llm(args: argparse.Namespace):
-    if args.provider == "fake":
-        from doomscroll.llm import FakeLLM
-        # Pre-seed fake with a generic reaction + empty consolidation,
-        # repeated indefinitely via routing
+def _build_llm(cfg: RunConfig):
+    if cfg.llm.provider == "fake":
         return _RoutingFakeLLM()
-    if not args.model:
-        raise SystemExit(f"--model is required for provider={args.provider}")
-    cfg = LLMConfig(model=args.model, temperature=args.temperature)
-    return make_llm(args.provider, cfg)
+    llm_cfg = LLMConfig(
+        model=cfg.llm.model or "",
+        temperature=cfg.llm.temperature,
+        max_tokens=cfg.llm.max_tokens,
+    )
+    return make_llm(cfg.llm.provider, llm_cfg)
 
 
-def _build_embedder(args: argparse.Namespace) -> Embedder:
-    if args.embedder == "fake":
+def _build_embedder(cfg: RunConfig) -> Embedder:
+    if cfg.embedder.provider == "fake":
         return FakeEmbedder(dim=64)
-    return make_embedder("openai", EmbeddingConfig(model=args.embedder_model))
+    return make_embedder(
+        "openai", EmbeddingConfig(model=cfg.embedder.model)
+    )
 
 
 class _RoutingFakeLLM:
-    """Used in --provider fake mode. Returns canned reactions and empty
+    """Used when llm.provider == fake. Returns canned reactions and empty
     consolidation. Lets the pipeline run end-to-end without API access."""
 
     def generate(self, prompt: str, max_tokens: int = 1024) -> str:
@@ -170,41 +151,40 @@ class _RoutingFakeLLM:
         )
 
 
-def _load_or_make_feed(args: argparse.Namespace, embedder: Embedder):
-    if args.snapshot:
-        if not args.snapshot.exists():
-            raise SystemExit(f"snapshot not found: {args.snapshot}")
-        feed = JSONSnapshotFeed(args.snapshot)
-        print(f"[feed] loaded snapshot: {args.snapshot} ({len(feed)} posts)")
+def _load_or_make_feed(cfg: RunConfig, embedder: Embedder):
+    if cfg.feed.snapshot:
+        path = Path(cfg.feed.snapshot)
+        if not path.exists():
+            raise SystemExit(f"snapshot not found: {path}")
+        feed = JSONSnapshotFeed(path)
+        print(f"[feed] loaded snapshot: {path} ({len(feed)} posts)")
         return feed
-    n = args.sessions * args.posts_per_session
-    print(f"[feed] no snapshot provided, generating synthetic ({n} posts)")
-    return SyntheticFeed(
-        embedder=embedder, n_posts=n, seed=args.seed,
-    )
+    n = cfg.pilot.sessions * cfg.pilot.posts_per_session
+    print(f"[feed] no snapshot configured, generating synthetic ({n} posts)")
+    return SyntheticFeed(embedder=embedder, n_posts=n, seed=cfg.pilot.seed)
 
 
 def _run_one_agent(
     variant_name: str,
     distortion: DistortionConfig,
     posts: list,
-    args: argparse.Namespace,
+    cfg: RunConfig,
     llm,
     embedder: Embedder,
     db_path: Path,
 ) -> dict:
     """Run one agent end-to-end. Returns per-agent summary dict."""
     print(f"[agent {variant_name}] starting on {db_path.name}")
-    mem_config = MemoryConfig()
-    cfg = ConsolidationConfig()
-    posts_per = args.posts_per_session
+    mem_config = cfg.memory.to_dataclass()
+    cons_config = cfg.consolidation.to_dataclass()
+    posts_per = cfg.pilot.posts_per_session
     base_ts = 0.0
     final_state = None
     sessions_run = 0
     total_processed = 0
     total_engaged = 0
     with Store(db_path) as store:
-        for s in range(args.sessions):
+        for s in range(cfg.pilot.sessions):
             session_start = base_ts + s * DAY_SECONDS
             session_end = session_start + SESSION_DURATION_SECONDS
             session_posts = posts[s * posts_per : (s + 1) * posts_per]
@@ -215,13 +195,13 @@ def _run_one_agent(
                 posts=session_posts,
                 distortion=distortion,
                 mem_config=mem_config,
-                consolidation_config=cfg,
+                consolidation_config=cons_config,
                 llm=llm,
                 embedder=embedder,
                 started_at=session_start,
                 ended_at=session_end,
-                consolidate_at_end=not args.no_consolidation,
-                seed=args.seed,
+                consolidate_at_end=cfg.pilot.consolidate,
+                seed=cfg.pilot.seed,
             )
             sessions_run += 1
             total_processed += final_state.posts_processed
@@ -255,7 +235,6 @@ def _run_one_agent(
 
 
 def _compute_cross_agent_metrics(per_agent: list[dict]) -> dict:
-    """Compute cross-agent divergence + per-agent topic entropy."""
     belief_sets: dict[str, np.ndarray] = {}
     for a in per_agent:
         embs = a["_belief_embeddings"]
@@ -265,7 +244,6 @@ def _compute_cross_agent_metrics(per_agent: list[dict]) -> dict:
         divergence = {}
     else:
         raw = cross_agent_divergence(belief_sets)
-        # Serialize tuple keys to "a__b" strings for JSON
         divergence = {
             f"{a}__{b}": float(d) for (a, b), d in raw.items() if a < b
         }
@@ -317,46 +295,58 @@ def _print_results_summary(per_agent: list[dict], cross: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    overrides = _parse_overrides(args.set)
+    try:
+        cfg = RunConfig.load(args.config, overrides)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from e
+    except Exception as e:
+        # pydantic ValidationError stringifies usefully
+        raise SystemExit(f"invalid config: {e}") from e
 
-    embedder = _build_embedder(args)
-    llm = _build_llm(args)
-    feed = _load_or_make_feed(args, embedder)
+    if args.print_config:
+        print(cfg.to_yaml())
+        return 0
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.write_to(cfg.output_dir / "config.yaml")
+
+    embedder = _build_embedder(cfg)
+    llm = _build_llm(cfg)
+    feed = _load_or_make_feed(cfg, embedder)
     posts = list(feed.iter_posts())
-    needed = args.sessions * args.posts_per_session
+    needed = cfg.pilot.sessions * cfg.pilot.posts_per_session
     if len(posts) < needed:
         print(
             f"[warn] feed has {len(posts)} posts but pilot wants {needed}; "
             "later sessions will be short."
         )
 
-    variants = _resolve_variants(args.variants)
+    variants = cfg.variant_distortions()
     started_at = time.time()
     per_agent: list[dict] = []
     for name, distortion in variants.items():
-        db_path = args.output_dir / f"agent_{name}.db"
-        # Fresh runs only -- don't accumulate across pilot invocations
+        db_path = cfg.output_dir / f"agent_{name}.db"
         if db_path.exists():
             db_path.unlink()
         summary = _run_one_agent(
-            name, distortion, posts, args, llm, embedder, db_path
+            name, distortion, posts, cfg, llm, embedder, db_path
         )
         per_agent.append(summary)
 
     cross = _compute_cross_agent_metrics(per_agent)
     elapsed = time.time() - started_at
 
-    # Strip large embedding arrays from the on-disk results
     results = {
         "metadata": {
             "started_at": started_at,
             "elapsed_seconds": elapsed,
-            "provider": args.provider,
-            "model": args.model,
-            "embedder": args.embedder,
-            "sessions": args.sessions,
-            "posts_per_session": args.posts_per_session,
-            "seed": args.seed,
+            "provider": cfg.llm.provider,
+            "model": cfg.llm.model,
+            "embedder": cfg.embedder.provider,
+            "sessions": cfg.pilot.sessions,
+            "posts_per_session": cfg.pilot.posts_per_session,
+            "seed": cfg.pilot.seed,
         },
         "per_agent": [
             {k: v for k, v in a.items() if not k.startswith("_")}
@@ -364,12 +354,13 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "cross_agent": cross,
     }
-    results_path = args.output_dir / "results.json"
+    results_path = cfg.output_dir / "results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
     _print_results_summary(per_agent, cross)
     print(f"\nresults written to: {results_path}")
+    print(f"resolved config:    {cfg.output_dir / 'config.yaml'}")
     print(f"elapsed: {elapsed:.1f}s")
     return 0
 

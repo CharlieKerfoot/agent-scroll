@@ -1,0 +1,16 @@
+# Real run with Claude + OpenAI embeddings. Override only what differs.
+# Run with: doomscroll-pilot --config configs/experiments/anthropic_pilot.yaml
+
+output_dir: ./pilot-anthropic
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+
+pilot:
+  sessions: 3
+  posts_per_session: 50

@@ -1,36 +1,69 @@
 """Tests for the pilot CLI runner.
 
-Invokes main() in fake mode against a tmp output dir. Validates that the
-end-to-end pipeline produces a results.json with the expected structure.
+The CLI is a thin wrapper around RunConfig + the agent loop. Tests drive
+it through `--set` overrides against a tmp output dir in fake mode.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
+import yaml
 
-from doomscroll.cli import _RoutingFakeLLM, _resolve_variants, main
-from doomscroll.config import AGENT_VARIANTS
+from doomscroll.cli import _RoutingFakeLLM, _parse_overrides, main
+from doomscroll.run_config import RunConfig
 
 
-class TestResolveVariants:
-    def test_all_default(self):
-        result = _resolve_variants(",".join(AGENT_VARIANTS.keys()))
-        assert set(result.keys()) == set(AGENT_VARIANTS.keys())
+class TestParseOverrides:
+    def test_nested_dotted_path(self):
+        out = _parse_overrides(["pilot.sessions=5", "llm.provider=anthropic"])
+        assert out == {
+            "pilot": {"sessions": 5},
+            "llm": {"provider": "anthropic"},
+        }
 
-    def test_subset(self):
-        result = _resolve_variants("balanced,high_confirmation_bias")
-        assert set(result.keys()) == {"balanced", "high_confirmation_bias"}
+    def test_yaml_typed_values(self):
+        out = _parse_overrides(
+            ["pilot.consolidate=false", "feed.snapshot=null", "llm.temperature=0.3"]
+        )
+        assert out["pilot"]["consolidate"] is False
+        assert out["feed"]["snapshot"] is None
+        assert out["llm"]["temperature"] == 0.3
 
-    def test_unknown_variant_exits(self):
-        with pytest.raises(SystemExit, match="unknown variant"):
-            _resolve_variants("balanced,not_a_real_variant")
+    def test_list_value(self):
+        out = _parse_overrides(["pilot.variants=[balanced, high_novelty_hunger]"])
+        assert out["pilot"]["variants"] == ["balanced", "high_novelty_hunger"]
 
-    def test_empty_exits(self):
-        with pytest.raises(SystemExit, match="no variants"):
-            _resolve_variants(",,")
+    def test_missing_equals_exits(self):
+        with pytest.raises(SystemExit, match="KEY=VALUE"):
+            _parse_overrides(["pilot.sessions"])
+
+
+class TestRunConfigLoad:
+    def test_defaults(self):
+        cfg = RunConfig.load()
+        assert cfg.llm.provider == "fake"
+        assert cfg.pilot.sessions == 3
+        assert "balanced" in cfg.pilot.variants
+
+    def test_unknown_variant_rejected(self):
+        with pytest.raises(Exception, match="unknown variants"):
+            RunConfig.load(overrides={"pilot": {"variants": ["not_a_real"]}})
+
+    def test_real_provider_requires_model(self):
+        with pytest.raises(Exception, match="llm.model is required"):
+            RunConfig.load(overrides={"llm": {"provider": "anthropic"}})
+
+    def test_yaml_round_trip(self, tmp_path):
+        cfg = RunConfig.load(
+            overrides={"pilot": {"sessions": 7}, "llm": {"temperature": 0.1}}
+        )
+        out = tmp_path / "cfg.yaml"
+        cfg.write_to(out)
+        reloaded = RunConfig.load(out)
+        assert reloaded.pilot.sessions == 7
+        assert reloaded.llm.temperature == 0.1
 
 
 class TestRoutingFakeLLM:
@@ -49,44 +82,48 @@ class TestRoutingFakeLLM:
 
 
 class TestPilotRun:
-    def test_minimal_pilot_runs(self, tmp_path, capsys):
+    def test_minimal_pilot_runs(self, tmp_path):
         out_dir = tmp_path / "out"
         rc = main([
-            "--provider", "fake",
-            "--embedder", "fake",
-            "--output-dir", str(out_dir),
-            "--variants", "balanced,high_confirmation_bias",
-            "--sessions", "2",
-            "--posts-per-session", "10",
-            "--seed", "0",
+            "--set", f"output_dir={out_dir}",
+            "--set", "pilot.variants=[balanced, high_confirmation_bias]",
+            "--set", "pilot.sessions=2",
+            "--set", "pilot.posts_per_session=10",
+            "--set", "pilot.seed=0",
         ])
         assert rc == 0
-        # Per-agent DBs created
         assert (out_dir / "agent_balanced.db").exists()
         assert (out_dir / "agent_high_confirmation_bias.db").exists()
-        # results.json structure
-        results_path = out_dir / "results.json"
-        assert results_path.exists()
-        with open(results_path) as f:
-            results = json.load(f)
+        assert (out_dir / "config.yaml").exists()
+
+        results = json.loads((out_dir / "results.json").read_text())
         assert results["metadata"]["provider"] == "fake"
         assert results["metadata"]["sessions"] == 2
         assert len(results["per_agent"]) == 2
         for agent_summary in results["per_agent"]:
             assert agent_summary["sessions_run"] == 2
             assert agent_summary["posts_processed"] == 20
-            # Fake LLM returns empty consolidation -> no beliefs accumulate
             assert agent_summary["belief_count"] == 0
+
+    def test_resolved_config_dumped(self, tmp_path):
+        out_dir = tmp_path / "out"
+        main([
+            "--set", f"output_dir={out_dir}",
+            "--set", "pilot.variants=[balanced]",
+            "--set", "pilot.sessions=1",
+            "--set", "pilot.posts_per_session=5",
+        ])
+        dumped = yaml.safe_load((out_dir / "config.yaml").read_text())
+        assert dumped["pilot"]["sessions"] == 1
+        assert dumped["pilot"]["variants"] == ["balanced"]
 
     def test_summary_printed(self, tmp_path, capsys):
         out_dir = tmp_path / "out"
         main([
-            "--provider", "fake",
-            "--embedder", "fake",
-            "--output-dir", str(out_dir),
-            "--variants", "balanced",
-            "--sessions", "1",
-            "--posts-per-session", "5",
+            "--set", f"output_dir={out_dir}",
+            "--set", "pilot.variants=[balanced]",
+            "--set", "pilot.sessions=1",
+            "--set", "pilot.posts_per_session=5",
         ])
         captured = capsys.readouterr().out
         assert "PILOT RESULTS" in captured
@@ -95,33 +132,56 @@ class TestPilotRun:
     def test_idempotent_reruns(self, tmp_path):
         out_dir = tmp_path / "out"
         argv = [
-            "--provider", "fake", "--embedder", "fake",
-            "--output-dir", str(out_dir),
-            "--variants", "balanced",
-            "--sessions", "1", "--posts-per-session", "5",
-            "--seed", "1",
+            "--set", f"output_dir={out_dir}",
+            "--set", "pilot.variants=[balanced]",
+            "--set", "pilot.sessions=1",
+            "--set", "pilot.posts_per_session=5",
+            "--set", "pilot.seed=1",
         ]
         main(argv)
-        first = json.load(open(out_dir / "results.json"))
-        main(argv)  # rerun should clobber, not accumulate
-        second = json.load(open(out_dir / "results.json"))
+        first = json.loads((out_dir / "results.json").read_text())
+        main(argv)
+        second = json.loads((out_dir / "results.json").read_text())
         assert (
             first["per_agent"][0]["posts_processed"]
             == second["per_agent"][0]["posts_processed"]
         )
 
     def test_missing_model_for_real_provider_exits(self, tmp_path):
-        with pytest.raises(SystemExit, match="--model is required"):
+        with pytest.raises(SystemExit, match="llm.model is required"):
             main([
-                "--provider", "anthropic",
-                "--output-dir", str(tmp_path / "out"),
-                "--sessions", "1", "--posts-per-session", "1",
+                "--set", f"output_dir={tmp_path / 'out'}",
+                "--set", "llm.provider=anthropic",
             ])
 
     def test_missing_snapshot_exits(self, tmp_path):
         with pytest.raises(SystemExit, match="snapshot not found"):
             main([
-                "--provider", "fake", "--embedder", "fake",
-                "--output-dir", str(tmp_path / "out"),
-                "--snapshot", str(tmp_path / "nope.json"),
+                "--set", f"output_dir={tmp_path / 'out'}",
+                "--set", f"feed.snapshot={tmp_path / 'nope.json'}",
             ])
+
+    def test_print_config_exits_without_running(self, tmp_path, capsys):
+        rc = main([
+            "--set", f"output_dir={tmp_path / 'out'}",
+            "--print-config",
+        ])
+        assert rc == 0
+        captured = capsys.readouterr().out
+        assert "pilot:" in captured
+        # No run actually happened
+        assert not (tmp_path / "out").exists()
+
+    def test_loads_yaml_file(self, tmp_path):
+        cfg_path = tmp_path / "run.yaml"
+        cfg_path.write_text(yaml.safe_dump({
+            "output_dir": str(tmp_path / "out"),
+            "pilot": {
+                "variants": ["balanced"],
+                "sessions": 1,
+                "posts_per_session": 5,
+            },
+        }))
+        rc = main(["--config", str(cfg_path)])
+        assert rc == 0
+        assert (tmp_path / "out" / "results.json").exists()

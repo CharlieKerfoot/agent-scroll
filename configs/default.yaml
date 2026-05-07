@@ -1,0 +1,45 @@
+# Default pilot run config. Copy this and override only what you need.
+# Every field is optional; omitted fields fall back to RunConfig defaults.
+
+output_dir: ./pilot-output
+
+llm:
+  provider: fake          # anthropic | openai | openrouter | fake
+  model: null             # required for non-fake providers
+  temperature: 0.7
+  max_tokens: 1024
+
+embedder:
+  provider: fake          # openai | fake
+  model: text-embedding-3-small
+
+feed:
+  snapshot: null          # path to a prepared snapshot JSON; null -> synthetic feed
+
+pilot:
+  variants:
+    - balanced
+    - high_confirmation_bias
+    - high_novelty_hunger
+    - high_mood_volatility
+  sessions: 3
+  posts_per_session: 50
+  seed: 42
+  consolidate: true
+
+# Memory + consolidation tunables. Touch only for ablation studies.
+memory:
+  trace_decay_lambda: 0.0289
+  centroid_weight_decay_lambda: 0.00412
+  centroid_alpha: 0.1
+  centroid_max_count: 5
+  new_centroid_similarity_threshold: 0.55
+  target_engagement_rate: 0.15
+  salience_warmup_posts: 50
+
+consolidation:
+  belief_sample_size: 20
+  fragment_max_count: 50
+  confidence_weight_alpha: 0.7
+  recency_weight_alpha: 0.3
+  max_belief_updates_per_pass: 3
